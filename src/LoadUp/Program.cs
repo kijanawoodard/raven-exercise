@@ -7,6 +7,8 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Timers;
 using CommandLine;
+using Raven.Abstractions.Data;
+using Raven.Abstractions.Extensions;
 using Raven.Client;
 using Raven.Client.Document;
 
@@ -14,7 +16,7 @@ namespace LoadUp
 {
 	class Program
 	{
-		private const int Quantity = 1000*1000;
+		private const int Quantity = 100*1000;
 		private static IDocumentStore _store;
 
 		private static int _concurrent, _total = 0;
@@ -23,11 +25,17 @@ namespace LoadUp
 		private static int _failureWrites, _failureReads = 0;
 
 		private static int _percentageReads = 50;
-		private static Random _decider;
+		private static int[] _decider;
+		private static int[] _reads;
+		private static int[] _writes;
+		private static char[] _chars;
+
+		const string Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
 		static void Main(string[] args)
 		{
-			_decider = new Random();
+			System.Net.ServicePointManager.DefaultConnectionLimit = 12 * 8; //8 cores
+
 			_store = new DocumentStore
 			{
 				ConnectionStringName = "RavenDB",
@@ -42,6 +50,14 @@ namespace LoadUp
 				_percentageReads = options.PercentageReads;
 			}
 
+			var rnd = new Random();
+			_decider = Enumerable.Range(0, requests).Select(x => rnd.Next(1, 100)).ToArray();
+			_reads = Enumerable.Range(0, requests).Select(x => rnd.Next(1, Quantity)).ToArray();
+			_writes = Enumerable.Range(0, requests).Select(x => rnd.Next(1, Quantity)).ToArray();
+			_chars = Enumerable.Range(0, requests).Select(x => rnd.Next(Chars.Length)).Select(x => Chars[x]).ToArray();
+
+			Init();
+
 			Console.WriteLine("Starting - {0} requests / {1}% reads", requests, _percentageReads);
 
 			var timer = new System.Timers.Timer(1000);
@@ -52,17 +68,22 @@ namespace LoadUp
 			Parallel.For(0, requests, Execute);
 			sw.Stop();
 
-			Console.WriteLine();
-			Console.WriteLine("************************************************");
-			Console.WriteLine("{0,10:n0} succeeded \n{1,10:n0} failed \n{2:n0} per second \n{7} minutes \nreads:  {3,10:n0} {4,10:n0} \nwrites: {5,10:n0} {6,10:n0}", 
+			using (new FlowerBox())
+			{
+				Console.WriteLine("{0,10:n0} succeeded \n" +
+				                  "{1,10:n0} failed \n\n" +
+				                  "{2:n0} per second \n" +
+				                  "{7} minutes \nreads:  {3,10:n0} {4,10:n0} \n" +
+				                  "writes: {5,10:n0} {6,10:n0} \n\n" +
+				                  "final concurrent {8}", 
 								_successReads+_successWrites, 
 								_failureReads+_failureWrites, 
 								Math.Round(requests / sw.Elapsed.TotalSeconds), 
 								_successReads,_failureReads,
 								_successWrites,_failureWrites,
-								Math.Round(sw.Elapsed.TotalMinutes, 2));
-			Console.WriteLine("************************************************");
-			Console.WriteLine();
+								Math.Round(sw.Elapsed.TotalMinutes, 2),
+								_concurrent);
+			}
 		}
 
 		static void Report(object o, ElapsedEventArgs args)
@@ -74,16 +95,16 @@ namespace LoadUp
 		{
 			Interlocked.Increment(ref _concurrent);
 			Interlocked.Increment(ref _total);
-			if (_decider.Next(1, 100) <= _percentageReads)
-				Read();
+			if (_decider[i] <= _percentageReads)
+				Read(i);
 			else
-				Write();
+				Write(i);
 			Interlocked.Decrement(ref _concurrent);
 		}
 
-		static void Read()
+		static void Read(int i)
 		{
-			var id = new Random().Next(1, Quantity);
+			var id = _reads[i];
 			using (var session = _store.OpenSession())
 			{
 				var document = session.Load<Document>(id);
@@ -98,12 +119,10 @@ namespace LoadUp
 			}
 		}
 
-		static void Write()
+		static void Write(int i)
 		{
-			var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-			var random = new Random();
-			var id = random.Next(1, Quantity);
-			var character = chars[random.Next(chars.Length)];
+			var id = _writes[i];
+			var character = _chars[i];
 			
 			using (var session = _store.OpenSession())
 			{
@@ -119,6 +138,56 @@ namespace LoadUp
 					Interlocked.Increment(ref _failureWrites);
 				}
 			}
+		}
+
+		static void Init()
+		{
+			using (var session = _store.OpenSession())
+			{
+				var any = session.Query<Document>().Any();
+				if (any)
+				{
+					using (new FlowerBox())
+					{
+						Console.WriteLine("Docs already in db");
+					}
+					
+					return;
+				}
+			}
+
+			using (new FlowerBox())
+			{
+				Console.WriteLine("Starting Init");	
+			}
+
+			var sw = Stopwatch.StartNew();
+			var data = new string('a', 2000);
+			var options = new BulkInsertOptions() { CheckForUpdates = true, BatchSize = (int)Math.Pow(2, 15) };
+
+			using (var bulkInsert = _store.BulkInsert(options: options))
+			{
+				bulkInsert.Report += bulkInsert_Report;
+				for (int i = 0; i < Quantity; i++)
+				{
+					bulkInsert.Store(new Document { Data = data });
+				}
+			}
+
+			sw.Stop();
+
+			using (new FlowerBox())
+			{
+				Console.WriteLine("Initialized {0:n0} documents in {1} minutes. {2} per second",
+											Quantity,
+											Math.Round(sw.Elapsed.TotalMinutes, 2),
+											Math.Round(Quantity / sw.Elapsed.TotalSeconds));
+			}
+		}
+
+		static void bulkInsert_Report(string obj)
+		{
+			Console.WriteLine(obj);
 		}
 	}
 
@@ -141,5 +210,24 @@ namespace LoadUp
 
 		[Option('p', "percent-reads", DefaultValue = 50, HelpText = "Percentage of requests that will be reads. The remainder will be writes.")]
 		public int PercentageReads { get; set; }
+	}
+
+	class FlowerBox : IDisposable
+	{
+		private readonly Action[] _graphics = new Action[]
+		{
+			() => Console.WriteLine(),
+			() => Console.WriteLine("************************************************")
+		};
+
+		public FlowerBox()
+		{
+			_graphics.ForEach(action => action());
+		}
+
+		public void Dispose()
+		{
+			_graphics.Reverse().ForEach(action => action());
+		}
 	}
 }

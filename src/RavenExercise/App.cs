@@ -24,7 +24,8 @@ namespace RavenExercise
         {
 	        var sw = Stopwatch.StartNew();
 	        var data = new string('a', 2000);
-	        var options = new BulkInsertOptions() {CheckForUpdates = true, BatchSize = 2048};
+	        var options = new BulkInsertOptions() { CheckForUpdates = true, BatchSize = 2048};
+		
 	        using (var bulkInsert = MvcApplication.DocumentStore.BulkInsert(options: options))
 	        {
 				for (int i = 0; i < Quantity; i++)
